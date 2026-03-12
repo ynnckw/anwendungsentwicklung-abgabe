@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: ghcn
+          POSTGRES_PASSWORD: ghcn
+          POSTGRES_DB: ghcn
+        options: >-
+          --health-cmd "pg_isready -U ghcn -d ghcn"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgresql://ghcn:ghcn@localhost:5432/ghcn?schema=public
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Get pnpm store path
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Wait for DB port
+        shell: bash
+        run: |
+          for i in {1..30}; do
+            (echo > /dev/tcp/127.0.0.1/5432) >/dev/null 2>&1 && echo "DB port is open" && exit 0
+            echo "Waiting for DB..."
+            sleep 2
+          done
+          echo "DB did not become ready in time"
+          exit 1
+
+      - name: Build shared (required for prisma seed)
+        run: pnpm --filter ./packages/shared build
+
+      - name: Prisma generate
+        run: pnpm prisma generate --schema prisma/schema.prisma
+
+      - name: Prisma migrate + seed
+        run: |
+          pnpm prisma migrate deploy --schema prisma/schema.prisma
+          pnpm prisma db seed --schema prisma/schema.prisma
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Test
+        run: pnpm test
+
+      - name: Test Coverage
+        run: |
+          pnpm --filter @webanwendung/shared test:coverage
+          pnpm --filter @webanwendung/api test:coverage
+          pnpm --filter @webanwendung/web test:coverage
+
+      - name: Stage coverage report artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .artifacts/coverage-report
+          found=0
+
+          for dir in \
+            packages/shared/coverage \
+            apps/api/coverage \
+            apps/web/coverage
+          do
+            if [ -d "$dir" ]; then
+              mkdir -p ".artifacts/coverage-report/$(dirname "$dir")"
+              cp -R "$dir" ".artifacts/coverage-report/$dir"
+              found=1
+            fi
+          done
+
+          echo "Collected coverage files:"
+          find .artifacts/coverage-report -type f | sort || true
+
+          if [ "$found" -eq 0 ]; then
+            echo "No coverage reports were generated."
+            exit 1
+          fi
+
+      - name: Upload coverage report (HTML + lcov)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          if-no-files-found: error
+          path: .artifacts/coverage-report
+
+      - name: Build
+        run: pnpm build
