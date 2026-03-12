@@ -1,0 +1,141 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ghcn
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U postgres -d ghcn"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # spielt optional einen vorbereiteten Demo-Datensatz ein
+  seed_restore:
+    image: postgis/postgis:16-3.4
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: ghcn
+      OFFLINE_SEED_ENABLED: ${OFFLINE_SEED_ENABLED:-1}
+      OFFLINE_SEED_FORCE: ${OFFLINE_SEED_FORCE:-0}
+      OFFLINE_SEED_FILE: ${OFFLINE_SEED_FILE:-/repo/seed/offline-demo-db.sql.gz}
+    volumes:
+      - ./:/repo:ro
+    command:
+      - sh
+      - -c
+      - |
+          set -e
+          if [ "$${OFFLINE_SEED_ENABLED:-1}" != "1" ]; then
+            echo "Offline seed restore disabled (OFFLINE_SEED_ENABLED=$${OFFLINE_SEED_ENABLED:-1})"
+            exit 0
+          fi
+
+          f="$${OFFLINE_SEED_FILE:-/repo/seed/offline-demo-db.sql.gz}"
+          if [ ! -f "$${f}" ]; then
+            echo "Offline seed archive not found ($${f}) – skipping restore"
+            exit 0
+          fi
+
+          tableExists=$$(psql -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='Station'" 2>/dev/null || echo 0)
+          if [ "$${OFFLINE_SEED_FORCE:-0}" != "1" ] && [ "$${tableExists}" != "0" ]; then
+            cnt=$$(psql -tAc 'SELECT COUNT(*) FROM public."Station"' 2>/dev/null || echo 0)
+            if [ "$${cnt}" -gt 0 ]; then
+              echo "DB already contains data ($${cnt} stations) – skipping offline seed restore"
+              exit 0
+            fi
+          fi
+
+          if [ "$${OFFLINE_SEED_FORCE:-0}" = "1" ]; then
+            echo "OFFLINE_SEED_FORCE=1 – forcing offline seed restore"
+          fi
+
+          echo "Preparing public schema for offline seed restore"
+          psql -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO postgres; CREATE EXTENSION IF NOT EXISTS postgis;'
+
+          echo "Restoring offline seed from $${f} ..."
+          gzip -dc "$${f}" | sed '/^CREATE SCHEMA public;/d' | psql -v ON_ERROR_STOP=1
+          echo "Offline seed restore completed"
+    restart: "no"
+
+  importer:
+    image: ghcr.io/ynnckw/webanwendung-v1-api:latest
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/ghcn?schema=public
+      # Für Abgabe default AUS (schneller Start mit Offline-Seed). Aktivieren via env falls gewünscht.
+      NOAA_IMPORT_ENABLED: ${NOAA_IMPORT_ENABLED:-0}
+      NOAA_IMPORT_FORCE: ${NOAA_IMPORT_FORCE:-0}
+      NOAA_END_YEAR: ${NOAA_END_YEAR:-2025}
+      NOAA_CACHE_DIR: /data/noaa-cache
+      NOAA_PURGE_SYNTHETIC: ${NOAA_PURGE_SYNTHETIC:-1}
+    depends_on:
+      db:
+        condition: service_healthy
+      seed_restore:
+        condition: service_completed_successfully
+    volumes:
+      - noaa_cache:/data/noaa-cache
+    command:
+      [
+        "sh",
+        "-c",
+        "i=0; until pnpm prisma migrate deploy; do i=$$((i+1)); echo \"DB not reachable yet (attempt $$i/30)\"; if [ $$i -ge 30 ]; then exit 1; fi; sleep 2; done; \
+         a=0; until node apps/api/dist/importer/noaa.js; do a=$$((a+1)); echo \"Importer failed (attempt $$a/3) – retrying in 10s\"; if [ $$a -ge 3 ]; then exit 1; fi; sleep 10; done",
+      ]
+    restart: "no"
+
+  api:
+    image: ghcr.io/ynnckw/webanwendung-v1-api:latest
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/ghcn?schema=public
+      WEB_ORIGIN: http://localhost:3000
+      NODE_ENV: production
+      NOAA_END_YEAR: ${NOAA_END_YEAR:-2025}
+      CACHE_TTL_MINUTES: ${CACHE_TTL_MINUTES:-10}
+      CACHE_MAX_ENTRIES: ${CACHE_MAX_ENTRIES:-500}
+    ports:
+      - "3001:3001"
+    depends_on:
+      importer:
+        condition: service_completed_successfully
+    volumes:
+      - noaa_cache:/data/noaa-cache
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://localhost:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\"",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    image: ghcr.io/ynnckw/webanwendung-v1-web:latest
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:3001
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  db_data:
+  noaa_cache:

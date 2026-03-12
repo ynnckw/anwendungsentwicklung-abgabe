@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-slate-950 text-slate-100;
+}
+
+a {
+  @apply text-primary hover:text-blue-300;
+}
+
+/* Sichtbarer Fokus für Tastaturbedienung (WCAG) */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  @apply outline outline-2 outline-offset-2 outline-blue-300;
+}
+
+.leaflet-container {
+  height: 360px;
+  width: 100%;
+  border-radius: 1rem;
+}
